@@ -31,6 +31,7 @@ import itertools
 import logging
 import threading
 import time
+from collections import deque
 from contextvars import ContextVar
 from typing import Any, Callable, Iterable, Iterator, List, Optional, Set, Tuple, TypeVar
 
@@ -91,6 +92,7 @@ class _DeadlineService:
         self._heap: List[Tuple[float, int, CancelScope]] = []
         self._counter = itertools.count()
         self._thread: Optional[threading.Thread] = None
+        self._compact_at = 128
 
     def register(self, scope: "CancelScope") -> None:
         deadline = scope._deadline
@@ -98,12 +100,31 @@ class _DeadlineService:
             return
         with self._cond:
             heapq.heappush(self._heap, (deadline, next(self._counter), scope))
+            if len(self._heap) >= self._compact_at:
+                # The monitor only pops stale entries when they surface at
+                # the top, so stale entries sorted below a live far-future
+                # entry would otherwise pin their (exited) scopes until it
+                # fires.  Pruning at a doubling threshold keeps that
+                # retention bounded at amortized O(1) per registration.
+                self._heap = [
+                    (d, c, s)
+                    for (d, c, s) in self._heap
+                    if not (s._exited or s._deadline != d)
+                ]
+                heapq.heapify(self._heap)
+                self._compact_at = max(128, 2 * len(self._heap))
             if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(
                     target=self._run, name="cancelscope-deadline-monitor", daemon=True
                 )
                 self._thread.start()
             self._cond.notify()
+
+    # Cap on a single Condition.wait: an infinite or astronomically large
+    # deadline (deadline=math.inf is a natural "no deadline yet" idiom)
+    # must not overflow the platform timestamp and kill this thread.  A
+    # capped park just rescans and parks again.
+    _MAX_WAIT = 3600.0
 
     def _run(self) -> None:
         while True:
@@ -124,13 +145,22 @@ class _DeadlineService:
                     if due:
                         break
                     if self._heap:
-                        self._cond.wait(self._heap[0][0] - now)
+                        self._cond.wait(min(self._heap[0][0] - now, self._MAX_WAIT))
                     else:
                         self._cond.wait()
             for scope in due:
-                scope._set_cancelled(
-                    direct=True, reason="deadline expired", deadline_expired=True
-                )
+                # This thread is a process-wide singleton: whatever a user
+                # callback raises (including BaseExceptions, which
+                # _run_callback deliberately does not catch), the service
+                # must survive or every other registered deadline is lost.
+                try:
+                    scope._set_cancelled(
+                        direct=True, reason="deadline expired", deadline_expired=True
+                    )
+                except BaseException:
+                    _logger.exception(
+                        "cancelscope: error while firing deadline for %r", scope
+                    )
 
 
 _service = _DeadlineService()
@@ -261,10 +291,22 @@ class CancelScope:
         timeouts) — keep callbacks short and thread-safe.  Exceptions
         raised by callbacks are logged and suppressed.
 
+        Callbacks never fire after the scope has exited: ``__exit__``
+        discards them, and registering on an exited (uncancelled) scope
+        is a no-op.
+
         Returns a zero-argument function that unregisters the callback.
+        Unregistration cannot outrace a cancellation already in flight:
+        if ``cancel()`` has begun dispatching in another thread, the
+        callback may still run (even concurrently with, or after, the
+        unregister call returning).
         """
         with self._lock:
             if not self._event.is_set():
+                if self._exited:
+                    # The scope's body already completed; there is nothing
+                    # left to unblock, so never fire.
+                    return lambda: None
                 self._callbacks.append(callback)
 
                 def unregister() -> None:
@@ -291,21 +333,48 @@ class CancelScope:
         reason: Optional[str] = None,
         deadline_expired: bool = False,
     ) -> bool:
+        # Iterative traversal: recursing per nesting level would hit the
+        # recursion limit on deep scope chains, leaving descendants
+        # uncancelled (and killing the deadline-monitor thread when the
+        # cancel came from a deadline).
+        state = self._mark_cancelled(
+            direct=direct, reason=reason, deadline_expired=deadline_expired
+        )
+        if state is None:
+            return False
+        pending = deque([(self, state)])
+        while pending:
+            scope, (callbacks, children) = pending.popleft()
+            for callback in callbacks:
+                scope._run_callback(callback)
+            for child in children:
+                child_state = child._mark_cancelled(direct=False)
+                if child_state is not None:
+                    pending.append((child, child_state))
+        return True
+
+    def _mark_cancelled(
+        self,
+        *,
+        direct: bool,
+        reason: Optional[str] = None,
+        deadline_expired: bool = False,
+    ) -> Optional[Tuple[List[Callable[["CancelScope"], None]], List["CancelScope"]]]:
+        """Flip this one scope to cancelled under its lock.
+
+        Returns the (callbacks, children) snapshot to process outside the
+        lock, or None if the scope was already cancelled.
+        """
         with self._lock:
             if self._event.is_set():
-                return False
+                return None
             if direct:
                 self._cancel_called = True
                 self._deadline_expired = deadline_expired
                 self._reason = reason
             self._event.set()
             callbacks, self._callbacks = self._callbacks, []
-            children = list(self._children)
-        for callback in callbacks:
-            self._run_callback(callback)
-        for child in children:
-            child._set_cancelled(direct=False)
-        return True
+            return callbacks, list(self._children)
 
     # -- context management -------------------------------------------
 
@@ -330,6 +399,12 @@ class CancelScope:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         self._exited = True
+        with self._lock:
+            # A cancellation that lands after this point (late explicit
+            # cancel(), a deadline racing a clean exit, or parent
+            # propagation racing our removal below) must not run
+            # unblock-callbacks for a body that already completed.
+            self._callbacks.clear()
         _current.reset(self._ctx_token)
         parent = self._parent
         if parent is not None:
@@ -359,7 +434,11 @@ class CancelScope:
         nearest: Optional[float] = None
         node: Optional[CancelScope] = self
         while node is not None:
-            d = node._deadline
+            # An exited ancestor (reachable via bind() when the parent
+            # finishes in its own thread first) has a dead deadline; once
+            # it lies in the past it would otherwise pin sleep() into a
+            # 1ms poll loop.
+            d = None if node._exited else node._deadline
             if d is not None and (nearest is None or d < nearest):
                 nearest = d
             node = node._parent

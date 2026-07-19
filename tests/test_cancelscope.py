@@ -1,3 +1,5 @@
+import contextlib
+import math
 import queue
 import threading
 import time
@@ -527,3 +529,151 @@ def test_on_cancel_unregister_after_cancel_is_noop():
     unreg2()  # must not raise
     assert len(fired) == 2
 
+
+# -- concurrency regressions ------------------------------------------
+
+
+def test_infinite_timeout_does_not_break_deadline_service():
+    # Regression: an inf (or > platform time_t) deadline used to make the
+    # monitor thread call Condition.wait(inf), which raised OverflowError
+    # and killed the thread — stranding every other registered deadline
+    # (a fail_after registered while the thread was dying never fired).
+    from cancelscope._impl import _service
+
+    with cs.CancelScope(timeout=math.inf):
+        # Settle first: the monitor must actually reach the park before
+        # its liveness means anything.  Without this the assertion races
+        # the thread's death and passes even against the broken version.
+        time.sleep(0.25)
+        assert _service._thread is not None and _service._thread.is_alive()
+        # And the service must still be able to fire other deadlines.
+        with pytest.raises(TimeoutError):
+            with cs.fail_after(0.1):
+                cs.sleep(5)
+    assert _service._thread.is_alive()
+
+
+def test_on_cancel_does_not_fire_after_clean_exit():
+    # Regression: __exit__ used to leave callbacks registered, so a late
+    # cancel() (e.g. from a thread that doesn't know the scope finished)
+    # ran "unblock the body" callbacks after the body had completed.
+    fired = []
+    with cs.CancelScope() as scope:
+        scope.on_cancel(lambda s: fired.append(s))
+    scope.cancel()
+    assert fired == []
+    assert scope.cancelled  # the cancellation itself still takes effect
+
+
+def test_on_cancel_registered_after_exit_never_fires():
+    fired = []
+    with cs.CancelScope() as scope:
+        pass
+    unreg = scope.on_cancel(lambda s: fired.append(s))
+    scope.cancel()
+    unreg()  # must not raise
+    assert fired == []
+
+
+def test_deadline_expiry_racing_clean_exit_does_not_fire_callback():
+    # Regression: two scopes sharing one deadline are popped by the
+    # monitor in a single batch, first-registered first.  A's slow
+    # callback used to delay B's dispatch past B's clean exit, so B's
+    # close-the-socket callback fired ~150ms after B.__exit__ returned.
+    deadline = time.monotonic() + 0.05
+    fired_after_exit = []
+    exited = threading.Event()
+
+    a = cs.CancelScope(deadline=deadline, name="a")
+    with a:
+        a.on_cancel(lambda s: time.sleep(0.25))
+
+        def worker():
+            with cs.CancelScope(deadline=deadline, name="b") as b:
+                b.on_cancel(
+                    lambda s: fired_after_exit.append(True)
+                    if exited.is_set()
+                    else None
+                )
+                end = time.monotonic() + 0.15
+                while time.monotonic() < end:
+                    time.sleep(0.005)
+            exited.set()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join(timeout=5)
+        time.sleep(0.3)  # let the monitor drain the batch
+    assert not t.is_alive()
+    assert fired_after_exit == []
+
+
+def test_deep_nesting_cancel_does_not_hit_recursion_limit():
+    # Regression: child propagation recursed once per nesting level, so
+    # cancelling the root of a chain deeper than the recursion limit
+    # raised RecursionError and left the deepest scopes uncancelled.
+    depth = 1500
+    with contextlib.ExitStack() as stack:
+        root = stack.enter_context(cs.CancelScope())
+        deepest = root
+        for _ in range(depth):
+            deepest = stack.enter_context(cs.CancelScope())
+        root.cancel()  # must not raise
+        assert deepest.cancelled
+
+
+def test_deep_nesting_deadline_wakes_sleeper():
+    # Deadline-driven variant of the above: the RecursionError used to
+    # kill the monitor thread, so the sleeper slept its full duration.
+    start = time.monotonic()
+    with contextlib.ExitStack() as stack:
+        root = stack.enter_context(cs.move_on_after(0.15))
+        for _ in range(1500):
+            stack.enter_context(cs.CancelScope())
+        cs.sleep(10)
+    assert root.cancelled_caught
+    assert time.monotonic() - start < 5
+
+
+def test_heap_does_not_pin_exited_scopes_behind_live_entry():
+    # Regression: stale heap entries are only popped when they surface at
+    # the top, so exited scopes whose deadlines sorted below a live
+    # far-future entry were pinned (50k scopes retained in one measured
+    # run).  register() now compacts at a doubling threshold.
+    from cancelscope._impl import _service
+
+    with cs.CancelScope(timeout=100):  # live entry at the heap top
+        for _ in range(2000):
+            with cs.move_on_after(200):  # sorts below the live entry
+                pass
+        with _service._cond:
+            heap_len = len(_service._heap)
+    assert heap_len < 300
+
+
+def test_sleep_does_not_busy_poll_after_bound_ancestor_exits():
+    # Regression: via bind(), a parent can exit (in its own thread) while
+    # a worker still sleeps under it.  The parent's stale deadline, once
+    # in the past, used to pin sleep() into a ~1ms poll loop (hundreds of
+    # wakeups per second).
+    wait_calls = []
+
+    def worker():
+        with cs.CancelScope() as child:
+            real_wait = child._event.wait
+
+            def counting_wait(timeout=None):
+                wait_calls.append(timeout)
+                return real_wait(timeout)
+
+            child._event.wait = counting_wait
+            cs.sleep(0.5)
+
+    parent = cs.CancelScope(timeout=0.1)
+    with parent:
+        t = threading.Thread(target=cs.bind(worker))
+        t.start()
+        time.sleep(0.02)
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert len(wait_calls) < 20
