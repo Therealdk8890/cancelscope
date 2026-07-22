@@ -28,6 +28,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Therealdk8890/cancelscope"
+Source = "https://github.com/Therealdk8890/cancelscope"
+Issues = "https://github.com/Therealdk8890/cancelscope/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=7"]
 
