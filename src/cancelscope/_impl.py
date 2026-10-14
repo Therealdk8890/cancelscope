@@ -343,14 +343,24 @@ class CancelScope:
         if state is None:
             return False
         pending = deque([(self, state)])
+        callback_error: BaseException | None = None
         while pending:
             scope, (callbacks, children) = pending.popleft()
             for callback in callbacks:
-                scope._run_callback(callback)
+                try:
+                    scope._run_callback(callback)
+                except BaseException as exc:
+                    # Do not let a callback's KeyboardInterrupt/SystemExit
+                    # leave descendants uncancelled. Finish propagating state,
+                    # then preserve BaseException semantics for the caller.
+                    if callback_error is None:
+                        callback_error = exc
             for child in children:
                 child_state = child._mark_cancelled(direct=False)
                 if child_state is not None:
                     pending.append((child, child_state))
+        if callback_error is not None:
+            raise callback_error
         return True
 
     def _mark_cancelled(
