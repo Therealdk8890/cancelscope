@@ -677,3 +677,15 @@ def test_sleep_does_not_busy_poll_after_bound_ancestor_exits():
     t.join(timeout=5)
     assert not t.is_alive()
     assert len(wait_calls) < 20
+
+
+def test_baseexception_callback_does_not_interrupt_child_cancellation():
+    seen = []
+    with cs.CancelScope() as parent:
+        with cs.CancelScope() as child:
+            parent.on_cancel(lambda scope: (_ for _ in ()).throw(SystemExit("callback")))
+            parent.on_cancel(lambda scope: seen.append("second callback"))
+            with pytest.raises(SystemExit, match="callback"):
+                parent.cancel()
+            assert child.cancelled
+            assert seen == ["second callback"]
